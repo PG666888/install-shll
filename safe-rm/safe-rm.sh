@@ -1,17 +1,16 @@
 #!/usr/bin/env bash
 #
-# safe-rm 完整管理脚本 (回收站保留目录结构 + sudo 用户日志 + 恢复功能)
+# safe-rm 完整管理脚本 (回收站保留目录结构 + sudo 用户日志 + 交互式恢复)
 #
 
 set -e
 
-SAFE_RM_PATH="/usr/local/bin/rm"   # 放在 PATH 前面，覆盖系统 rm
+SAFE_RM_PATH="/usr/local/bin/rm"   # 覆盖 PATH 中 rm
 REAL_RM="/bin/rm"                   # 系统原 rm
 LOG_FILE="/var/log/safe-rm.log"
 LOGROTATE_FILE="/etc/logrotate.d/safe-rm"
 CRON_CMD="$SAFE_RM_PATH --clean"
 
-# 日志记录函数
 log_action() {
     user=${SUDO_USER:-$(whoami)}
     echo "$(date +"%Y-%m-%d %H:%M:%S") | user=$user | action=$1 | file=$2" >> "$LOG_FILE"
@@ -36,17 +35,63 @@ usage() {
   默认      移动到 \$TRASH_DIR (保留目录结构)
   --purge   真删除 (调用 \$REAL_RM)
   --clean   清理回收站中 7 天以上的文件
-  restore   恢复回收站文件
+  restore   交互式恢复回收站文件
 USAGE
     exit 1
 }
 
 [[ $# -eq 0 ]] && usage
 
-restore_trash() {
-    echo "[INFO] 从 $HOME/.trash 恢复文件..."
-    find "$HOME/.trash" -type f | while read -r file; do
-        orig_path="${file#$HOME/.trash}"
+restore_trash_interactive() {
+    files=($(find "$TRASH_DIR" -type f | sort))
+    count=${#files[@]}
+
+    if [[ $count -eq 0 ]]; then
+        echo "[INFO] 回收站为空"
+        return
+    fi
+
+    echo "[INFO] 回收站文件列表:"
+    for i in "${!files[@]}"; do
+        echo "[$i] ${files[$i]#$TRASH_DIR/}"
+    done
+
+    echo "恢复选项："
+    echo "  输入索引(空格分隔)恢复单个或多个文件"
+    echo "  输入 'all' 恢复全部文件"
+    echo "  输入 'keyword:<关键字>' 按文件名关键字恢复"
+    echo "  输入 'dir:<目录路径>' 恢复某个目录下所有文件"
+
+    read -r selection
+
+    selected_files=()
+    if [[ "$selection" == "all" ]]; then
+        selected_files=("${files[@]}")
+    elif [[ "$selection" == keyword:* ]]; then
+        key="${selection#keyword:}"
+        for f in "${files[@]}"; do
+            [[ "$(basename "$f")" == *"$key"* ]] && selected_files+=("$f")
+        done
+    elif [[ "$selection" == dir:* ]]; then
+        dir_path="${selection#dir:}"
+        dir_path="$(realpath "$dir_path")"
+        for f in "${files[@]}"; do
+            [[ "$f" == "$TRASH_DIR$dir_path"* ]] && selected_files+=("$f")
+        done
+    else
+        indices=($selection)
+        for idx in "${indices[@]}"; do
+            [[ -n "${files[$idx]}" ]] && selected_files+=("${files[$idx]}")
+        done
+    fi
+
+    if [[ ${#selected_files[@]} -eq 0 ]]; then
+        echo "[INFO] 没有匹配的文件可恢复"
+        return
+    fi
+
+    for file in "${selected_files[@]}"; do
+        orig_path="${file#$TRASH_DIR}"
         orig_dir="$(dirname "$orig_path")"
         mkdir -p "$orig_dir"
 
@@ -64,9 +109,9 @@ restore_trash() {
             echo "[INFO] 已恢复: $orig_path"
         fi
     done
-    find "$HOME/.trash" -type d -empty -delete
+
+    find "$TRASH_DIR" -type d -empty -delete
     echo "[SUCCESS] 恢复完成。"
-    exit 0
 }
 
 case "$1" in
@@ -86,7 +131,8 @@ case "$1" in
         exit 0
         ;;
     restore)
-        restore_trash
+        restore_trash_interactive
+        exit 0
         ;;
 esac
 
@@ -137,19 +183,15 @@ EOF
 
     echo "[SUCCESS] 安装完成！rm 默认进入 safe-rm 回收站，保留目录结构。"
     echo "[INFO] 使用 '--purge' 真删除: rm --purge <file>"
-    echo "[INFO] 使用 'restore' 恢复文件: rm restore"
+    echo "[INFO] 使用 'restore' 交互式恢复文件: rm restore"
     echo "[INFO] 日志文件: $LOG_FILE"
 }
 
 uninstall_safe_rm() {
     echo "[INFO] 卸载 safe-rm ..."
-
     [[ -f "$SAFE_RM_PATH" ]] && sudo rm -f "$SAFE_RM_PATH" && echo "[INFO] 已删除 $SAFE_RM_PATH"
     [[ -f "$LOGROTATE_FILE" ]] && sudo rm -f "$LOGROTATE_FILE" && echo "[INFO] 删除 logrotate 配置"
-
-    echo "[INFO] 清理 cron 定时任务 ..."
     crontab -l 2>/dev/null | grep -v "$CRON_CMD" | crontab - || true
-
     echo "[SUCCESS] safe-rm 已卸载完成。"
 }
 
@@ -175,7 +217,6 @@ case "$1" in
         clean_trash
         ;;
     restore)
-        echo "[INFO] 使用 'rm restore' 恢复回收站文件"
         "$SAFE_RM_PATH" restore
         ;;
     *)
